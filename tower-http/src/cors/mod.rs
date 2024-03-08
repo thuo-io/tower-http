@@ -49,6 +49,7 @@
 
 #![allow(clippy::enum_variant_names)]
 
+use allow_origin::AllowOriginFuture;
 use bytes::{BufMut, BytesMut};
 use http::{
     header::{self, HeaderName},
@@ -73,6 +74,9 @@ mod allow_private_network;
 mod expose_headers;
 mod max_age;
 mod vary;
+
+#[cfg(test)]
+mod tests;
 
 pub use self::{
     allow_credentials::AllowCredentials, allow_headers::AllowHeaders, allow_methods::AllowMethods,
@@ -319,6 +323,42 @@ impl CorsLayer {
     /// let layer = CorsLayer::new().allow_origin(AllowOrigin::predicate(
     ///     |origin: &HeaderValue, _request_parts: &RequestParts| {
     ///         origin.as_bytes().ends_with(b".rust-lang.org")
+    ///     },
+    /// ));
+    /// ```
+    ///
+    /// Additionally, you can use a closure that returns a future:
+    ///
+    /// Because the future must be static, you must only pass owned values into it.
+    ///
+    /// ```
+    /// # #[derive(Clone)]
+    /// # struct Client;
+    /// # fn get_api_client() -> Client {
+    /// #     Client
+    /// # }
+    /// # impl Client {
+    /// #     async fn fetch_allowed_origins(&self, path: String) -> Vec<HeaderValue> {
+    /// #         vec![]
+    /// #     }
+    /// # }
+    /// use tower_http::cors::{CorsLayer, AllowOrigin};
+    /// use http::{request::Parts as RequestParts, HeaderValue};
+    ///
+    /// let client = get_api_client();
+    ///
+    /// let layer = CorsLayer::new().allow_origin(AllowOrigin::async_predicate(
+    ///     move |origin: &HeaderValue, request_parts: &RequestParts| {
+    ///         let client = client.clone();
+    ///         let origin = origin.clone();
+    ///         let path = request_parts.uri.path().to_owned();
+    ///
+    ///         async move {
+    ///             // fetch list of origins that are allowed for this path
+    ///             let origins = client.fetch_allowed_origins(path).await;
+    ///
+    ///             origins.contains(&origin)
+    ///         }
     ///     },
     /// ));
     /// ```
@@ -618,10 +658,12 @@ where
 
         // These headers are applied to both preflight and subsequent regular CORS requests:
         // https://fetch.spec.whatwg.org/#http-responses
-        headers.extend(self.layer.allow_origin.to_header(origin, &parts));
+
         headers.extend(self.layer.allow_credentials.to_header(origin, &parts));
         headers.extend(self.layer.allow_private_network.to_header(origin, &parts));
         headers.extend(self.layer.vary.to_header());
+
+        let allow_origin_future = self.layer.allow_origin.to_header(origin, &parts);
 
         // Return results immediately upon preflight request
         if parts.method == Method::OPTIONS {
@@ -631,7 +673,10 @@ where
             headers.extend(self.layer.max_age.to_header(origin, &parts));
 
             ResponseFuture {
-                inner: Kind::PreflightCall { headers },
+                inner: Kind::PreflightCall {
+                    allow_origin_future,
+                    headers,
+                },
             }
         } else {
             // This header is applied only to non-preflight requests
@@ -640,6 +685,8 @@ where
             let req = Request::from_parts(parts, body);
             ResponseFuture {
                 inner: Kind::CorsCall {
+                    allow_origin_future,
+                    allow_origin_complete: false,
                     future: self.inner.call(req),
                     headers,
                 },
@@ -661,10 +708,15 @@ pin_project! {
     enum Kind<F> {
         CorsCall {
             #[pin]
+            allow_origin_future: AllowOriginFuture,
+            allow_origin_complete: bool,
+            #[pin]
             future: F,
             headers: HeaderMap,
         },
         PreflightCall {
+            #[pin]
+            allow_origin_future: AllowOriginFuture,
             headers: HeaderMap,
         },
     }
@@ -679,20 +731,37 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project().inner.project() {
-            KindProj::CorsCall { future, headers } => {
+            KindProj::CorsCall {
+                allow_origin_future,
+                allow_origin_complete,
+                future,
+                headers,
+            } => {
+                if !*allow_origin_complete {
+                    headers.extend(ready!(allow_origin_future.poll(cx)));
+                    *allow_origin_complete = true;
+                }
+
                 let mut response: Response<B> = ready!(future.poll(cx))?;
+
+                let response_headers = response.headers_mut();
 
                 // vary header can have multiple values, don't overwrite
                 // previously-set value(s).
                 if let Some(vary) = headers.remove(header::VARY) {
-                    headers.append(header::VARY, vary);
+                    response_headers.append(header::VARY, vary);
                 }
                 // extend will overwrite previous headers of remaining names
-                response.headers_mut().extend(headers.drain());
+                response_headers.extend(headers.drain());
 
                 Poll::Ready(Ok(response))
             }
-            KindProj::PreflightCall { headers } => {
+            KindProj::PreflightCall {
+                allow_origin_future,
+                headers,
+            } => {
+                headers.extend(ready!(allow_origin_future.poll(cx)));
+
                 let mut response = Response::new(B::default());
                 mem::swap(response.headers_mut(), headers);
 
